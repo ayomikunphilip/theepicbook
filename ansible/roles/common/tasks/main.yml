@@ -1,0 +1,20 @@
+---
+- name: Update apt package cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install common packages
+  ansible.builtin.apt:
+    name:
+      - git
+      - curl
+      - rsync
+      - python3-pymysql
+    state: present
+
+- name: Create 2G swap file (small servers run out of memory during npm install)
+  ansible.builtin.shell: |
+    fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  args:
+    creates: /swapfile
