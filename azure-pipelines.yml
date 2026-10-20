@@ -1,19 +1,124 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
-
+# Application pipeline: Prepare -> Validate -> Configure and Deploy -> Verify
 trigger:
-- main
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - ansible/*
+      - config/*
+      - db/*
+      - models/*
+      - public/*
+      - routes/*
+      - views/*
+      - server.js
+      - package.json
+      - package-lock.json
+      - azure-pipelines.yml
 
+# Runs on the self-hosted agent on AWS
 pool:
-  vmImage: ubuntu-latest
+  name: aws-agent-pool
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+variables:
+  - group: Epicbook-mysql-secrets
+  - name: sshSecureFileName
+    value: 'epicbook-aws-key'
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+stages:
+  - stage: Prepare
+    displayName: 'Prepare'
+    jobs:
+      - job: prepare
+        displayName: 'Install Ansible and download SSH key'
+        steps:
+          - checkout: self
+          - script: |
+              set -euo pipefail
+              command -v ansible >/dev/null || sudo apt-get install -y ansible
+              ansible --version | head -1
+              ansible-galaxy collection install community.mysql:5.0.2 ansible.posix
+            displayName: 'Install Ansible and collections'
+          - task: DownloadSecureFile@1
+            name: sshKey
+            displayName: 'Download SSH private key'
+            inputs:
+              secureFile: '$(sshSecureFileName)'
+          - script: chmod 600 "$(sshKey.secureFilePath)" && echo "SSH key ready"
+            displayName: 'Protect SSH key'
+
+  - stage: Validate
+    displayName: 'Validate'
+    dependsOn: Prepare
+    jobs:
+      - job: validate
+        displayName: 'Validate inventory, playbook and SSH access'
+        steps:
+          - checkout: self
+          # The key is downloaded again because each job gets a fresh temp area
+          - task: DownloadSecureFile@1
+            name: sshKey
+            displayName: 'Download SSH private key'
+            inputs:
+              secureFile: '$(sshSecureFileName)'
+          - script: |
+              set -euo pipefail
+              chmod 600 "$(sshKey.secureFilePath)"
+              mkdir -p ~/.ssh
+              grep -o 'ansible_host=[0-9.]*' ansible/inventory/hosts.ini | cut -d= -f2 | xargs ssh-keyscan -H >> ~/.ssh/known_hosts 2>/dev/null
+              ansible-inventory -i ansible/inventory/hosts.ini --list > /dev/null
+              ansible-playbook -i ansible/inventory/hosts.ini ansible/site.yml --syntax-check
+              ansible -i ansible/inventory/hosts.ini all -m ping -e "ansible_ssh_private_key_file=$(sshKey.secureFilePath)"
+            displayName: 'Inventory, syntax check and SSH ping'
+
+  - stage: Deploy
+    displayName: 'Configure and Deploy'
+    dependsOn: Validate
+    jobs:
+      - job: deploy
+        displayName: 'Run the Ansible playbook'
+        steps:
+          - checkout: self
+          - task: DownloadSecureFile@1
+            name: sshKey
+            displayName: 'Download SSH private key'
+            inputs:
+              secureFile: '$(sshSecureFileName)'
+          - script: |
+              set -euo pipefail
+              chmod 600 "$(sshKey.secureFilePath)"
+              mkdir -p ~/.ssh
+              grep -o 'ansible_host=[0-9.]*' ansible/inventory/hosts.ini | cut -d= -f2 | xargs ssh-keyscan -H >> ~/.ssh/known_hosts 2>/dev/null
+              # Secrets go into a private temp file, never onto the command line or into logs
+              umask 077
+              printf 'db_admin_username: "%s"\ndb_admin_password: "%s"\n' "$DB_USER" "$DB_PASS" > "$(Agent.TempDirectory)/dbvars.yml"
+              ansible-playbook -i ansible/inventory/hosts.ini ansible/site.yml \
+                -e "ansible_ssh_private_key_file=$(sshKey.secureFilePath)" \
+                -e "@$(Agent.TempDirectory)/dbvars.yml"
+            displayName: 'Run site.yml'
+            env:
+              DB_USER: $(mysqlAdminUsername)
+              DB_PASS: $(mysqlAdminPassword)
+          - script: rm -f "$(Agent.TempDirectory)/dbvars.yml"
+            displayName: 'Remove temporary secrets file'
+            condition: always()
+
+  - stage: Verify
+    displayName: 'Verify'
+    dependsOn: Deploy
+    jobs:
+      - job: verify
+        displayName: 'Summarize the result'
+        steps:
+          - checkout: self
+          # ansible-playbook exits with an error on any failed or unreachable host,
+          # so reaching this stage means the recap showed 0 failed and 0 unreachable
+          - script: |
+              set -euo pipefail
+              echo "Deploy stage succeeded: 0 failed, 0 unreachable."
+              echo "Hosts configured:"
+              grep -o '^[a-z_]* ansible_host=[0-9.]*' ansible/inventory/hosts.ini
+              APP_IP=$(grep -o '^app_server ansible_host=[0-9.]*' ansible/inventory/hosts.ini | cut -d= -f2)
+              echo "Open this URL in a browser: http://$APP_IP"
+            displayName: 'Print verification summary'
