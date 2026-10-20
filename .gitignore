@@ -1,2 +1,12 @@
 node_modules
 .DS_Store
+
+# Ansible / SSH
+*.pem
+*.key
+epicbook-aws-key
+terraform-aws-vm-key
+id_rsa
+id_ed25519
+ansible/group_vars/*/vault.yml
+*.retry
